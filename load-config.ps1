@@ -31,11 +31,17 @@ function Get-DeployConfig {
     $deployPath = [Environment]::ExpandEnvironmentVariables([string]$raw.deployPath)
     $deployPath = [System.IO.Path]::GetFullPath($deployPath)
 
+    $enableLog = $true
+    if ($null -ne $raw.PSObject.Properties['enableLog']) {
+        $enableLog = [bool]$raw.enableLog
+    }
+
     return [PSCustomObject]@{
         DeployPath     = $deployPath
         RegistryScope  = $scope
         RegName        = $regName
         RegistryPath   = "${scope}:\Software\Microsoft\Windows\CurrentVersion\Run"
+        EnableLog      = $enableLog
     }
 }
 

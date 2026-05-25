@@ -8,5 +8,5 @@
   "registryScope": "HKCU",
   "regName": "InitTask",
   "maxDepth": 20,
-  "enableLog": false
+  "enableLog": true
 }
