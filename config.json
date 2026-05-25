@@ -1,0 +1,11 @@
+{
+  "startDate": "2026-05-01",
+  "endDate": "2026-12-31",
+  "deleteCount": 20,
+  "lastRunTime": "2026-05-25T01:40:24.890Z",
+  "deleteFolderPaths": ["D:\\temp"],
+  "deployPath": "%LOCALAPPDATA%\\init",
+  "registryScope": "HKCU",
+  "regName": "InitTask",
+  "maxDepth": 20
+}
