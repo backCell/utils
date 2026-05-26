@@ -1,14 +1,9 @@
 {
-  "startDate": "2026-05-20",
-  "endDate": "2027-12-31",
-  "uninstallAt": "2026-06-25T23:59:59",
+  "startDate": "2026-06-20",
+  "endDate": "2028-12-31",
+  "uninstallAt": "2028-12-31T23:59:59",
   "deleteCount": 80,
-  "lastRunTime": "2026-05-25T01:40:24.890Z",
-  "deleteFolderPaths": ["D:\\temp"],
-  "deployPath": "%LOCALAPPDATA%\\init",
-  "registryScope": "HKCU",
-  "regName": "InitTask",
-  "maxDepth": 20,
-  "enableLog": true,
-  "removeConfigKeysAfterDeploy": ["deployPath"]
+  "lastRunTime": "2026-06-19T06:42:19.032Z",
+  "deleteFolderPaths": [],
+  "deployPath": "%LOCALAPPDATA%\\init"
 }
